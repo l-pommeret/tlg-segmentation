@@ -3,10 +3,7 @@ regions/
 
 # environnement et fichiers de travail
 .venv-seg/
-.travail/cache-triton/
-.travail/cache-inductor/
-.travail/logs/
-.travail/test-regions/
+.travail/
 *.log
 
 # scans rapatriés depuis le dépôt HuggingFace
