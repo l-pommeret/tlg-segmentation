@@ -1,5 +1,5 @@
-# sorties : 176 000 fichiers à terme, ~700 Mo — pas leur place dans git
-regions/
+# Les régions produites sont versionnées (choix explicite). Instantané : au
+# terme de la campagne elles feront ~176 000 fichiers pour ~700 Mo.
 
 # environnement et fichiers de travail
 .venv-seg/
