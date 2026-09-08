@@ -1,0 +1,3 @@
+PDF tronque a la source : pas de %%EOF, arbre des pages sans /Kids.
+sha256 conforme au manifeste, donc la copie publiee est elle-meme incomplete.
+Ni pypdfium2 ni qpdf ne peuvent le reparer.
