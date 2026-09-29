@@ -1,10 +1,14 @@
 #!/bin/bash
 # Segmenter tout le dépôt en occupant les deux A6000.
 #
-# Mesuré sur une A6000 : 1 processus = 4,6 pages/s, 2 = 5,1, 3 = 5,25, 4 = 5,8.
-# Un processus ne sature donc pas la carte, mais le rendement décroît vite ;
-# 4 par carte est le point où le gain paie encore la mémoire (4,8 Go par
-# processus à LOT=32, sur 48 Go).
+# Sur les deux A6000, débit total mesuré selon le nombre de workers :
+# 8 -> 10,5 pages/s, 12 -> 11,4, 16 -> 10,9. L'optimum est donc 6 par carte ;
+# au-delà, la contention l'emporte et la mémoire approche la saturation
+# (38 Go sur 48 à 16 workers).
+#
+# Les workers se servent dans une file commune (réservation atomique par
+# volume) plutôt que dans une tranche fixe : les volumes vont de 0,2 Mo à
+# 700 Mo, un découpage statique laisserait un worker finir seul.
 #
 #   ./lancer.sh [sortie] [plafond_volumes]
 
@@ -12,11 +16,15 @@ set -u
 ICI=/people/pommeret/jean-claude
 SORTIE=${1:-$ICI/regions}
 PLAFOND=${2:-0}
-PAR_GPU=${PAR_GPU:-4}
+PAR_GPU=${PAR_GPU:-6}
 GPUS=${GPUS:-2}
-PARTS=$((GPUS * PAR_GPU))
+WORKERS=$((GPUS * PAR_GPU))
 LOGS=$ICI/.travail/logs
 mkdir -p "$LOGS" "$SORTIE"
+
+# Une réservation laissée par un processus mort bloquerait son volume : la
+# campagne démarre donc sur une table nette.
+find "$SORTIE" -name _encours -delete 2>/dev/null
 
 # CC pointe vers un compilateur conda disparu : triton compile au chargement.
 export CC=/usr/bin/gcc CXX=/usr/bin/g++
@@ -27,10 +35,28 @@ export TOKENIZERS_PARALLELISM=false
 # Chaque worker a déjà son pool de rendu : laisser torch prendre 96 cœurs par
 # processus les ferait se piétiner.
 export OMP_NUM_THREADS=4
+# Le rendu des manuscrits coûte 0,375 s/page contre 0,092 pour l'imprimé :
+# trois processus de rendu par worker, sinon le GPU attend le CPU.
+export RENDUS=${RENDUS:-3}
+# Les manuscrits font des pages lourdes : sans segments extensibles, la
+# fragmentation du cache CUDA provoque des dépassements sur les gros lots.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "$PARTS workers ($PAR_GPU par GPU sur $GPUS), sortie $SORTIE"
-for ((p = 0; p < PARTS; p++)); do
-  CUDA_VISIBLE_DEVICES=$((p % GPUS)) PART=$p PARTS=$PARTS \
+# L'inventaire du dépôt se construit une fois : huit workers interrogeant
+# l'API de front se font refuser (HTTP 429).
+export INVENTAIRE=$ICI/.travail/inventaire.json
+if [ ! -s "$INVENTAIRE" ]; then
+  echo "construction de l'inventaire..."
+  "$ICI/.venv-seg/bin/python" -c "
+import sys; sys.path.insert(0, '$ICI')
+import segmente
+v = segmente.inventaire()
+print(f'{len(v)} volumes, {sum(o for _, o in v)/1e9:.1f} Go')" || exit 1
+fi
+
+echo "$WORKERS workers ($PAR_GPU par GPU sur $GPUS), sortie $SORTIE"
+for ((p = 0; p < WORKERS; p++)); do
+  CUDA_VISIBLE_DEVICES=$((p % GPUS)) PART=$p \
     "$ICI/.venv-seg/bin/python" "$ICI/segmente.py" "$SORTIE" "$PLAFOND" \
     > "$LOGS/part$p.log" 2>&1 &
   echo "  part $p -> GPU $((p % GPUS))  (pid $!)"

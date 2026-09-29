@@ -5,33 +5,42 @@ des pages, qui est du calcul CPU, part dans un pool de processus, et le volume
 suivant se télécharge pendant que le courant est segmenté. Le GPU n'attend donc
 ni le disque ni le réseau.
 
-Plusieurs exemplaires se partagent le manifeste par PART/PARTS ; voir lancer.sh.
+Les volumes viennent de l'arborescence du dépôt, pas du manifeste : celui-ci
+est régénéré à part et retarde sur ce qui est réellement publié. Plusieurs
+exemplaires se partagent le travail par revendication atomique ; voir lancer.sh.
 """
 
 from __future__ import annotations
 
-import csv
 import io
 import json
 import os
 import queue
+import re
 import shutil
 import sys
 import tarfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import zipfile
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 DEPOT = "Zual/TLG_libre_scans"
-MANIFESTE = f"https://huggingface.co/datasets/{DEPOT}/resolve/main/hf_tlg_manifest.csv"
+ARBRE = f"https://huggingface.co/api/datasets/{DEPOT}/tree/main"
+BRUT = f"https://huggingface.co/datasets/{DEPOT}/resolve/main"
+RACINES = os.environ.get("RACINES", "source_pdfs,webdataset").split(",")
+# Huit workers interrogeant l'API en même temps valent un 429 : l'inventaire
+# se construit une fois et se relit depuis ce fichier.
+CACHE = Path(os.environ.get("INVENTAIRE", "")) if os.environ.get("INVENTAIRE") else None
 SOURCES = Path.home() / "tlg-sources"
 UTILES = {"Text", "TextInlineMath", "ListItem", "SectionHeader", "Title",
           "Caption", "Formula"}
 INTITULE = {"SectionHeader", "Title"}
-IMAGES = (".jpg", ".jpeg", ".png", ".tif", ".tiff")
+IMAGES = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".jp2", ".j2k")
+EMBALLAGES = (".pdf", ".tar", ".tar.gz", ".tgz", ".zip")
 
 # Le modèle ramène toute page à 768×768 : au-delà de 150 dpi on paie du rendu
 # pour rien. Mesuré sur un volume, 100, 150 et 300 dpi rendent les mêmes
@@ -52,11 +61,39 @@ def journal(message: str) -> None:
           flush=True)
 
 
-def manifeste() -> list[dict]:
-    """La liste des volumes, telle que le dépôt la publie."""
-    with urllib.request.urlopen(MANIFESTE, timeout=120) as flux:
-        texte = flux.read().decode("utf-8")
-    return list(csv.DictReader(io.StringIO(texte)))
+def inventaire() -> list[tuple[str, int]]:
+    """Ce que le dépôt contient réellement, le manifeste étant en retard.
+
+    Les volumes reviennent du plus gros au plus petit : avec une file de
+    travail, servir les longs d'abord raccourcit la traîne de fin.
+    """
+    if CACHE and CACHE.is_file():
+        return [(c, o) for c, o in json.loads(CACHE.read_text(encoding="utf-8"))]
+    trouves: dict[str, int] = {}
+    for racine in RACINES:
+        curseur = None
+        while True:
+            url = f"{ARBRE}/{racine}?recursive=true&expand=true"
+            if curseur:
+                url += "&cursor=" + urllib.parse.quote(curseur)
+            with urllib.request.urlopen(url, timeout=180) as flux:
+                lot = json.loads(flux.read().decode("utf-8"))
+                lien = flux.headers.get("Link") or ""
+            if not lot:
+                break
+            for entree in lot:
+                chemin = entree.get("path") or ""
+                if entree.get("type") == "file" and chemin.lower().endswith(EMBALLAGES):
+                    trouves[chemin] = entree.get("size") or 0
+            suite = re.search(r"cursor=([^&>;]+)", lien)
+            if not suite:
+                break
+            curseur = urllib.parse.unquote(suite.group(1))
+    liste = sorted(trouves.items(), key=lambda c: -c[1])
+    if CACHE:
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE.write_text(json.dumps(liste), encoding="utf-8")
+    return liste
 
 
 def rapatrier(chemin_distant: str) -> Path | None:
@@ -65,18 +102,23 @@ def rapatrier(chemin_distant: str) -> Path | None:
     if local.is_file() and local.stat().st_size > 0:
         return local
     SOURCES.mkdir(parents=True, exist_ok=True)
-    url = f"https://huggingface.co/datasets/{DEPOT}/resolve/main/{chemin_distant}"
+    url = f"{BRUT}/{urllib.parse.quote(chemin_distant)}"
     partiel = local.with_suffix(local.suffix + f".part{os.getpid()}")
-    try:
-        with urllib.request.urlopen(url, timeout=600) as flux, \
-                partiel.open("wb") as sortie:
-            shutil.copyfileobj(flux, sortie, 1 << 20)
-    except Exception as souci:  # noqa: BLE001
-        partiel.unlink(missing_ok=True)
-        journal(f"  ✗ téléchargement {chemin_distant[:52]} : {type(souci).__name__}")
-        return None
-    partiel.rename(local)
-    return local
+    # Le dépôt limite le débit quand huit workers tirent de front : patienter
+    # vaut mieux que renoncer au volume.
+    for essai in range(5):
+        try:
+            with urllib.request.urlopen(url, timeout=600) as flux, \
+                    partiel.open("wb") as sortie:
+                shutil.copyfileobj(flux, sortie, 1 << 20)
+            partiel.rename(local)
+            return local
+        except Exception as souci:  # noqa: BLE001
+            partiel.unlink(missing_ok=True)
+            dernier = souci
+            time.sleep(min(60, 4 ** essai))
+    journal(f"  ✗ téléchargement {chemin_distant[:52]} : {type(dernier).__name__}")
+    return None
 
 
 # --- rendu, exécuté dans le pool -------------------------------------------
@@ -144,7 +186,14 @@ def image_de_l_archive(volume: Path, membre: str):
     else:
         with zipfile.ZipFile(volume) as archive:
             donnees = archive.read(membre)
-    return Image.open(io.BytesIO(donnees)).convert("RGB")
+    try:
+        return Image.open(io.BytesIO(donnees)).convert("RGB")
+    except Exception:  # noqa: BLE001
+        # L'openjpeg embarqué dans Pillow refuse certains JPEG2000 dont le
+        # codestream est pourtant complet (marqueur EOC présent) ; imagecodecs
+        # les décode sans broncher. Une archive entière en dépendait.
+        import imagecodecs
+        return Image.fromarray(imagecodecs.jpeg2k_decode(donnees)).convert("RGB")
 
 
 # --- segmentation ----------------------------------------------------------
@@ -168,33 +217,41 @@ def decrire(resultat, image, complement: dict) -> dict:
             "regions": regions}
 
 
-def segmenter(predicteur, lot, dossier: Path) -> int:
+def segmenter(predicteur, lot, dossier: Path) -> tuple[int, int]:
     """Segmenter un paquet de pages ; en cas d'échec, retomber page à page."""
     images = [image for _, image, _ in lot]
     try:
         resultats = predicteur(images, batch_size=len(images))
     except Exception as souci:  # noqa: BLE001
         journal(f"  ✗ lot de {len(lot)} : {type(souci).__name__}, page à page")
+        # Reprendre sans rendre la mémoire, c'est échouer 32 fois de plus :
+        # le dépassement qui a tué le lot tue aussi chaque page isolée.
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
         resultats = []
-        for _, image, _ in lot:
+        for page, image, _ in lot:
             try:
                 resultats.append(predicteur([image], batch_size=1)[0])
-            except Exception:  # noqa: BLE001
+            except Exception as ennui:  # noqa: BLE001
+                journal(f"  ✗ page {page} : {type(ennui).__name__}")
                 resultats.append(None)
-    faites = 0
+    faites = echecs = 0
     for (page, image, complement), resultat in zip(lot, resultats):
         if resultat is None:
-            journal(f"  ✗ page {page}")
+            echecs += 1
             continue
         page_decrite = decrire(resultat, image, complement)
         page_decrite["page"] = page
         (dossier / f"p{page:06d}.json").write_text(
             json.dumps(page_decrite), encoding="utf-8")
         faites += 1
-    return faites
+    return faites, echecs
 
 
-def volume_pdf(predicteur, volume: Path, dossier: Path) -> int:
+def volume_pdf(predicteur, volume: Path, dossier: Path) -> tuple[int, int]:
     """Segmenter un PDF : le rendu part au pool, le GPU consomme au fil de l'eau."""
     from PIL import Image
 
@@ -202,9 +259,9 @@ def volume_pdf(predicteur, volume: Path, dossier: Path) -> int:
     restantes = [p for p in range(1, total + 1)
                  if not (dossier / f"p{p:06d}.json").is_file()]
     if not restantes:
-        return 0
+        return 0, 0
     journal(f"  {total} pages, {len(restantes)} à faire")
-    faites = 0
+    faites = echecs = 0
     lot = []
     # Le pool naît et meurt avec le volume : ses processus relâchent ainsi le
     # PDF avant qu'on l'efface.
@@ -217,25 +274,28 @@ def volume_pdf(predicteur, volume: Path, dossier: Path) -> int:
             lot.append((page, Image.open(io.BytesIO(jpeg)).convert("RGB"),
                         {"resolution": round(dpi, 1)}))
             if len(lot) == LOT:
-                faites += segmenter(predicteur, lot, dossier)
+                f, e = segmenter(predicteur, lot, dossier)
+                faites += f; echecs += e
                 lot = []
         if lot:
-            faites += segmenter(predicteur, lot, dossier)
-    return faites
+            f, e = segmenter(predicteur, lot, dossier)
+            faites += f; echecs += e
+    return faites, echecs
 
 
-def volume_archive(predicteur, volume: Path, dossier: Path) -> int:
+def volume_archive(predicteur, volume: Path, dossier: Path) -> tuple[int, int]:
     """Segmenter une archive d'images : décoder coûte peu, on reste ici."""
     membres = pages_de_l_archive(volume)
-    faites = 0
+    faites = echecs = 0
     lot = []
     for page, membre in enumerate(membres, 1):
         if (dossier / f"p{page:06d}.json").is_file():
             continue
         try:
             image = image_de_l_archive(volume, membre)
-        except Exception:  # noqa: BLE001
-            journal(f"  ✗ page {page} illisible")
+        except Exception as souci:  # noqa: BLE001
+            journal(f"  ✗ page {page} illisible : {type(souci).__name__}")
+            echecs += 1
             continue
         source = image.size
         if max(source) > COTE_MAX:
@@ -243,19 +303,43 @@ def volume_archive(predicteur, volume: Path, dossier: Path) -> int:
             image.thumbnail((COTE_MAX, COTE_MAX))
         lot.append((page, image, {"taille_source": list(source)}))
         if len(lot) == LOT:
-            faites += segmenter(predicteur, lot, dossier)
+            f, e = segmenter(predicteur, lot, dossier)
+            faites += f; echecs += e
             lot = []
     if lot:
-        faites += segmenter(predicteur, lot, dossier)
-    return faites
+        f, e = segmenter(predicteur, lot, dossier)
+        faites += f; echecs += e
+    return faites, echecs
 
 
-# --- téléchargement en avance ----------------------------------------------
+# --- file de travail partagée ----------------------------------------------
 
 
-def prefetcheur(travaux, fil: queue.Queue) -> None:
-    """Tirer le volume suivant pendant que le courant occupe le GPU."""
-    for rang, distant, dossier in travaux:
+def revendiquer(dossier: Path) -> bool:
+    """Réserver un volume pour ce processus, sans concertation.
+
+    La création exclusive d'un fichier est atomique : le premier qui l'obtient
+    prend le volume, les autres passent. Une file partagée plutôt qu'un
+    découpage fixe, car les volumes vont de 0,2 Mo à 700 Mo — un worker à qui
+    le sort donne les gros finirait des heures après les autres.
+    """
+    dossier.mkdir(parents=True, exist_ok=True)
+    try:
+        with (dossier / "_encours").open("x", encoding="utf-8") as marque:
+            marque.write(f"{os.getpid()} {time.strftime('%F %T')}\n")
+        return True
+    except FileExistsError:
+        return False
+
+
+def prefetcheur(volumes, sortie: Path, fil: queue.Queue) -> None:
+    """Prendre le volume suivant et le tirer pendant que le GPU travaille."""
+    for rang, (distant, _) in enumerate(volumes, 1):
+        dossier = sortie / distant.replace("/", "__")
+        if (dossier / "_termine").is_file() or (dossier / "_ignore").is_file():
+            continue
+        if not revendiquer(dossier):
+            continue
         fil.put((rang, distant, dossier, rapatrier(distant)))
     fil.put(None)
 
@@ -263,36 +347,20 @@ def prefetcheur(travaux, fil: queue.Queue) -> None:
 def main() -> int:
     sortie = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "regions"
     plafond = int(sys.argv[2]) if len(sys.argv) > 2 else 0
-    part = int(os.environ.get("PART", "0"))
-    parts = int(os.environ.get("PARTS", "1"))
     sortie.mkdir(parents=True, exist_ok=True)
 
-    volumes = manifeste()
+    volumes = inventaire()
     if plafond:
         volumes = volumes[:plafond]
-
-    # Le manifeste répète un fichier quand plusieurs œuvres en proviennent :
-    # 415 lignes pour 409 chemins. Sans ce dédoublonnage, deux rangs différents
-    # tombent sur deux workers qui segmentent le même volume dans le même
-    # dossier — le travail est fait deux fois.
-    uniques, vus = [], set()
-    for entree in volumes:
-        distant = entree.get("repo_path") or ""
-        if distant and distant not in vus:
-            vus.add(distant)
-            uniques.append(distant)
-
-    travaux = []
-    for rang, distant in enumerate(uniques, 1):
-        if rang % parts != part % parts:
-            continue
-        dossier = sortie / distant.replace("/", "__")
-        if (dossier / "_termine").is_file() or (dossier / "_ignore").is_file():
-            continue
-        travaux.append((rang, distant, dossier))
-    journal(f"{len(volumes)} lignes, {len(uniques)} volumes distincts, "
-            f"{len(travaux)} à faire ici")
-    if not travaux:
+    restants = sum(1 for c, _ in volumes
+                   if not (sortie / c.replace("/", "__") / "_termine").is_file()
+                   and not (sortie / c.replace("/", "__") / "_ignore").is_file())
+    octets = sum(o for c, o in volumes
+                 if not (sortie / c.replace("/", "__") / "_termine").is_file()
+                 and not (sortie / c.replace("/", "__") / "_ignore").is_file())
+    journal(f"{len(volumes)} volumes au dépôt, {restants} à faire "
+            f"({octets/1e9:.1f} Go)")
+    if not restants:
         return 0
 
     from surya.foundation import FoundationPredictor
@@ -303,7 +371,8 @@ def main() -> int:
     journal("modèle chargé")
 
     fil: queue.Queue = queue.Queue(maxsize=1)
-    threading.Thread(target=prefetcheur, args=(travaux, fil), daemon=True).start()
+    threading.Thread(target=prefetcheur, args=(volumes, sortie, fil),
+                     daemon=True).start()
 
     faites = 0
     debut = time.monotonic()
@@ -314,27 +383,39 @@ def main() -> int:
             break
         rang, distant, dossier, volume = article
         if volume is None:
+            # Rendre la réservation : un échec de réseau doit se retenter,
+            # pas condamner le volume au prochain passage.
+            (dossier / "_encours").unlink(missing_ok=True)
             continue
         dossier.mkdir(parents=True, exist_ok=True)
-        journal(f"[{rang}/{len(uniques)}] {distant[-56:]}")
+        journal(f"[{rang}/{len(volumes)}] {distant[-56:]}")
         nom = volume.name.lower()
         try:
             if nom.endswith(".pdf"):
-                faites += volume_pdf(predicteur, volume, dossier)
+                f, echecs = volume_pdf(predicteur, volume, dossier)
             elif nom.endswith((".tar", ".tar.gz", ".tgz", ".zip")):
-                faites += volume_archive(predicteur, volume, dossier)
+                f, echecs = volume_archive(predicteur, volume, dossier)
             else:
                 # .djvu : aucun décodeur ici (ni ddjvu, ni roue pip
                 # autonome). On le marque pour ne pas le retélécharger.
                 journal(f"  ⚠ emballage non géré, ignoré : {volume.name[:52]}")
                 (dossier / "_ignore").write_text("", encoding="utf-8")
+                (dossier / "_encours").unlink(missing_ok=True)
                 volume.unlink(missing_ok=True)
                 continue
         except Exception as souci:  # noqa: BLE001
             journal(f"  ✗ volume {distant[-40:]} : {type(souci).__name__}: {souci}")
+            (dossier / "_encours").unlink(missing_ok=True)
             volume.unlink(missing_ok=True)
             continue
-        (dossier / "_termine").write_text("", encoding="utf-8")
+        faites += f
+        if echecs:
+            # Sans marque d'achèvement, un prochain passage reprendra les
+            # pages manquantes : les déclarer faites les perdrait pour de bon.
+            journal(f"  ⚠ {echecs} page(s) en échec, volume laissé à reprendre")
+        else:
+            (dossier / "_termine").write_text("", encoding="utf-8")
+        (dossier / "_encours").unlink(missing_ok=True)
         # Le volume ne sert plus : le disque compte plus que le téléchargement.
         volume.unlink(missing_ok=True)
         ecoule = time.monotonic() - debut
