@@ -1,0 +1,2 @@
+PDF tronque a la source : pas de %%EOF, document illisible par pypdfium2.
+Detecte par verification prealable de la fin de fichier.

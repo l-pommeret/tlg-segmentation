@@ -1,0 +1,2 @@
+PDF tronque a la source (28 000 015 octets) : pas de %%EOF, pas de trailer.
+Ni pypdfium2 ni qpdf ne peuvent le lire. Versement amont interrompu.

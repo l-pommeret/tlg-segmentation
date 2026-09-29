@@ -1,0 +1,1 @@
+{"taille": [1000, 1366], "resolution": 150.0, "regions": [{"nature": "SectionHeader", "boite": [373, 290, 599, 309], "ordre": 0, "utile": true, "intitule": true}, {"nature": "Text", "boite": [173, 412, 802, 478], "ordre": 1, "utile": true, "intitule": false}, {"nature": "Code", "boite": [177, 493, 791, 1181], "ordre": 2, "utile": false, "intitule": false}], "page": 267}

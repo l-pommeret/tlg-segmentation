@@ -1,0 +1,1 @@
+{"taille": [1400, 960], "resolution": 12.1, "regions": [{"nature": "PageHeader", "boite": [1093, 103, 1115, 118], "ordre": 0, "utile": false, "intitule": false}, {"nature": "Text", "boite": [239, 121, 690, 815], "ordre": 1, "utile": true, "intitule": false}, {"nature": "Text", "boite": [697, 135, 1162, 840], "ordre": 2, "utile": true, "intitule": false}], "page": 34}
